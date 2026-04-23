@@ -10,6 +10,9 @@ import PIL
 import csv
 import random
 from PIL import ImageEnhance
+import subprocess
+import os
+import tempfile
 
 class RandomCropAndResize:
     def __init__(self, im_res):
@@ -114,52 +117,150 @@ class VideoAudioDataset(Dataset):
         self.augment_2 = ['None', 'concat', 'replace']
         self.augment_2_weight = [5, 1, 1]
 
+    def _extract_audio_from_video(self, video_path):
+        """使用ffmpeg从视频中提取音频到临时文件"""
+        try:
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpfile:
+                temp_audio_path = tmpfile.name
+            
+            # 使用ffmpeg提取音频
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-vn',  # 不处理视频
+                '-acodec', 'pcm_s16le',  # PCM 16-bit little-endian
+                '-ar', '16000',  # 采样率16kHz
+                '-ac', '1',  # 单声道
+                '-y',  # 覆盖输出文件
+                temp_audio_path
+            ]
+            
+            # 运行ffmpeg命令
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"ffmpeg error for {video_path}: {result.stderr}")
+                os.unlink(temp_audio_path)
+                return None
+            
+            return temp_audio_path
+            
+        except Exception as e:
+            print(f"Error extracting audio from {video_path}: {e}")
+            return None
+
     def _wav2fbank(self, filename):
-        waveform, sr = torchaudio.load(filename)
+        # 首先检查文件是否是视频文件
+        if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+            # 从视频中提取音频
+            audio_path = self._extract_audio_from_video(filename)
+            if audio_path is None:
+                print(f"Failed to extract audio from {filename}")
+                fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
+                # 清理临时文件
+                if os.path.exists(audio_path):
+                    os.unlink(audio_path)
+                return fbank
+            
+            # 加载提取的音频
+            try:
+                waveform, sr = torchaudio.load(audio_path)
+                # 清理临时文件
+                os.unlink(audio_path)
+            except Exception as e:
+                print(f"Error loading extracted audio {audio_path}: {e}")
+                if os.path.exists(audio_path):
+                    os.unlink(audio_path)
+                fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
+                return fbank
+        else:
+            # 直接加载音频文件
+            try:
+                waveform, sr = torchaudio.load(filename)
+            except Exception as e:
+                print(f"Error loading audio file {filename}: {e}")
+                fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
+                return fbank
+        
         waveform = waveform - waveform.mean()
 
         try:
             fbank = torchaudio.compliance.kaldi.fbank(waveform, htk_compat=True, sample_frequency=sr, use_energy=False, window_type='hanning', num_mel_bins=self.melbins, dither=0.0, frame_shift=10)
         except:
-            fbank = torch.zeros([512, 128]) + 0.01
+            fbank = torch.zeros([512, self.melbins]) + 0.01
             print('there is a loading error')
 
         target_length = self.target_length
-        # n_frames = fbank.shape[0]
 
-        # p = target_length - n_frames
-
-        # # cut and pad
-        # if p > 0:
-        #     m = torch.nn.ZeroPad2d((0, 0, 0, p))
-        #     fbank = m(fbank)
-        # elif p < 0:
-        #     fbank = fbank[0:target_length, :]
-
-        fbank = torch.nn.functional.interpolate(fbank.unsqueeze(0).transpose(1,2), size=(target_length, ), mode='linear', align_corners=False).transpose(1,2).squeeze(0)
+        # 使用插值调整到目标长度
+        fbank = torch.nn.functional.interpolate(
+            fbank.unsqueeze(0).transpose(1,2), 
+            size=(target_length, ), 
+            mode='linear', 
+            align_corners=False
+        ).transpose(1,2).squeeze(0)
 
         return fbank
 
     def _concat_wav2fbank(self, filename1, filename2):
-        waveform1, sr1 = torchaudio.load(filename1)
-        waveform2, sr2 = torchaudio.load(filename2)
-        waveform1 = waveform1 - waveform1.mean()
-        waveform2 = waveform2 - waveform2.mean()
-
-        try:
-            fbank1 = torchaudio.compliance.kaldi.fbank(waveform1, htk_compat=True, sample_frequency=sr1, use_energy=False, window_type='hanning', num_mel_bins=self.melbins, dither=0.0, frame_shift=10)
-            fbank2 = torchaudio.compliance.kaldi.fbank(waveform2, htk_compat=True, sample_frequency=sr2, use_energy=False, window_type='hanning', num_mel_bins=self.melbins, dither=0.0, frame_shift=10)
-        except:
-            fbank1 = torch.zeros([512, 128]) + 0.01
-            fbank2 = torch.zeros([512, 128]) + 0.01
-            print("there is a loading error")
+        # 处理第一个文件
+        if filename1.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+            audio_path1 = self._extract_audio_from_video(filename1)
+            if audio_path1 is None:
+                fbank1 = torch.zeros([512, self.melbins]) + 0.01
+            else:
+                try:
+                    waveform1, sr1 = torchaudio.load(audio_path1)
+                    os.unlink(audio_path1)
+                except:
+                    fbank1 = torch.zeros([512, self.melbins]) + 0.01
+        else:
+            try:
+                waveform1, sr1 = torchaudio.load(filename1)
+            except:
+                fbank1 = torch.zeros([512, self.melbins]) + 0.01
+        
+        # 处理第二个文件
+        if filename2.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+            audio_path2 = self._extract_audio_from_video(filename2)
+            if audio_path2 is None:
+                fbank2 = torch.zeros([512, self.melbins]) + 0.01
+            else:
+                try:
+                    waveform2, sr2 = torchaudio.load(audio_path2)
+                    os.unlink(audio_path2)
+                except:
+                    fbank2 = torch.zeros([512, self.melbins]) + 0.01
+        else:
+            try:
+                waveform2, sr2 = torchaudio.load(filename2)
+            except:
+                fbank2 = torch.zeros([512, self.melbins]) + 0.01
+        
+        # 如果成功加载了波形数据，计算fbank
+        if 'waveform1' in locals() and 'waveform2' in locals():
+            waveform1 = waveform1 - waveform1.mean()
+            waveform2 = waveform2 - waveform2.mean()
+            
+            try:
+                fbank1 = torchaudio.compliance.kaldi.fbank(waveform1, htk_compat=True, sample_frequency=sr1, use_energy=False, window_type='hanning', num_mel_bins=self.melbins, dither=0.0, frame_shift=10)
+                fbank2 = torchaudio.compliance.kaldi.fbank(waveform2, htk_compat=True, sample_frequency=sr2, use_energy=False, window_type='hanning', num_mel_bins=self.melbins, dither=0.0, frame_shift=10)
+            except:
+                fbank1 = torch.zeros([512, self.melbins]) + 0.01
+                fbank2 = torch.zeros([512, self.melbins]) + 0.01
+                print("there is a loading error")
 
         fbank = torch.concat((fbank1, fbank2), dim=0)
         
         target_length = self.target_length
 
         # Perform Down/Up Sample
-        fbank = torch.nn.functional.interpolate(fbank.unsqueeze(0).transpose(1,2), size=(target_length,), mode='linear', align_corners=False).transpose(1,2).squeeze(0)
+        fbank = torch.nn.functional.interpolate(
+            fbank.unsqueeze(0).transpose(1,2), 
+            size=(target_length,), 
+            mode='linear', 
+            align_corners=False
+        ).transpose(1,2).squeeze(0)
 
         return fbank
 
@@ -174,7 +275,8 @@ class VideoAudioDataset(Dataset):
             # Read the frames using the calculated indices
             frames = [vr[i].asnumpy() for i in frame_indices]
         except:
-            frames = torch.zeros(self.num_frames, 3, 224, 224)
+            frames = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(self.num_frames)]
+            print(f"Error loading video frames from {video_name}")
             
         return frames
     
@@ -195,7 +297,8 @@ class VideoAudioDataset(Dataset):
             frames = [frames[i] for i in frame_indices]
         
         except:
-            frames = torch.zeros(self.num_frames, 3, 224, 224)
+            frames = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(self.num_frames)]
+            print(f"Error loading concatenated video frames from {video_name1} and {video_name2}")
             
         return frames
     
@@ -219,11 +322,6 @@ class VideoAudioDataset(Dataset):
 
     def _augment_replace(self, index):
         video_name, label = self.data[index]
-        # if int(label) == 0:
-        #     frames = self._get_frames(video_name)
-        #     fbank = self._wav2fbank(video_name)
-        #     return fbank, frames, label
-        # else:
         label = 1
         index_1 = random.choice([i for i in range(len(self.data))])
         video_name_1, label_1 = self.data[index_1]
@@ -241,7 +339,7 @@ class VideoAudioDataset(Dataset):
             try:
                 fbank = self._wav2fbank(video_name)
             except:
-                fbank = torch.zeros([self.target_length, 128]) + 0.01
+                fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
                 print('there is an error in loading audio')
             
             frames = self._get_frames(video_name)
@@ -263,16 +361,11 @@ class VideoAudioDataset(Dataset):
                 try:
                     fbank = self._wav2fbank(video_name)
                 except:
-                    fbank = torch.zeros([self.target_length, 128]) + 0.01
+                    fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
                     print('there is an error in loading audio')
                 
                 frames = self._get_frames(video_name)
 
-            # for i, frame in enumerate(frames):
-                # if random.uniform(0, 1) < 0.1:
-                #     frames[i] = self.preprocess_aug(frame)
-                # else:
-                #     frames[i] = self.preprocess(frame)
             frames = [self.preprocess(frame) for frame in frames]
             frames = torch.stack(frames)
 
@@ -360,7 +453,6 @@ class VideoAudioEvalDataset(Dataset):
         print('now using {:d} * {:d} image input'.format(self.im_res, self.im_res))
         self.preprocess = T.Compose([
             T.ToPILImage(),
-            # T.Resize(self.im_res, interpolation=PIL.Image.BICUBIC),
             T.CenterCrop(self.im_res),
             T.ToTensor(),
             T.Normalize(
@@ -368,29 +460,82 @@ class VideoAudioEvalDataset(Dataset):
                 std=[0.2290, 0.2240, 0.2250]
             )])
 
+    def _extract_audio_from_video(self, video_path):
+        """使用ffmpeg从视频中提取音频到临时文件"""
+        try:
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpfile:
+                temp_audio_path = tmpfile.name
+            
+            # 使用ffmpeg提取音频
+            cmd = [
+                'ffmpeg',
+                '-i', video_path,
+                '-vn',
+                '-acodec', 'pcm_s16le',
+                '-ar', '16000',
+                '-ac', '1',
+                '-y',
+                temp_audio_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"ffmpeg error for {video_path}: {result.stderr}")
+                os.unlink(temp_audio_path)
+                return None
+            
+            return temp_audio_path
+            
+        except Exception as e:
+            print(f"Error extracting audio from {video_path}: {e}")
+            return None
+
     def _wav2fbank(self, filename):
-        waveform, sr = torchaudio.load(filename)
+        # 首先检查文件是否是视频文件
+        if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+            # 从视频中提取音频
+            audio_path = self._extract_audio_from_video(filename)
+            if audio_path is None:
+                print(f"Failed to extract audio from {filename}")
+                fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
+                return fbank
+            
+            # 加载提取的音频
+            try:
+                waveform, sr = torchaudio.load(audio_path)
+                os.unlink(audio_path)
+            except Exception as e:
+                print(f"Error loading extracted audio {audio_path}: {e}")
+                if os.path.exists(audio_path):
+                    os.unlink(audio_path)
+                fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
+                return fbank
+        else:
+            # 直接加载音频文件
+            try:
+                waveform, sr = torchaudio.load(filename)
+            except Exception as e:
+                print(f"Error loading audio file {filename}: {e}")
+                fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
+                return fbank
+        
         waveform = waveform - waveform.mean()
 
         try:
             fbank = torchaudio.compliance.kaldi.fbank(waveform, htk_compat=True, sample_frequency=sr, use_energy=False, window_type='hanning', num_mel_bins=self.melbins, dither=0.0, frame_shift=10)
         except:
-            fbank = torch.zeros([512, 128]) + 0.01
+            fbank = torch.zeros([512, self.melbins]) + 0.01
             print('there is a loading error')
 
         target_length = self.target_length
-        # n_frames = fbank.shape[0]
-
-        # p = target_length - n_frames
-
-        # # cut and pad
-        # if p > 0:
-        #     m = torch.nn.ZeroPad2d((0, 0, 0, p))
-        #     fbank = m(fbank)
-        # elif p < 0:
-        #     fbank = fbank[0:target_length, :]
         
-        fbank = torch.nn.functional.interpolate(fbank.unsqueeze(0).transpose(1,2), size=(target_length, ), mode='linear', align_corners=False).transpose(1,2).squeeze(0)
+        fbank = torch.nn.functional.interpolate(
+            fbank.unsqueeze(0).transpose(1,2), 
+            size=(target_length, ), 
+            mode='linear', 
+            align_corners=False
+        ).transpose(1,2).squeeze(0)
 
         return fbank
 
@@ -405,7 +550,8 @@ class VideoAudioEvalDataset(Dataset):
             # Read the frames using the calculated indices
             frames = [vr[i].asnumpy() for i in frame_indices]
         except:
-            frames = torch.zeros(self.num_frames, 3, 224, 224)
+            frames = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(self.num_frames)]
+            print(f"Error loading video frames from {video_name}")
             
         return frames
 
@@ -416,7 +562,7 @@ class VideoAudioEvalDataset(Dataset):
         try:
             fbank = self._wav2fbank(video_name)
         except:
-            fbank = torch.zeros([self.target_length, 128]) + 0.01
+            fbank = torch.zeros([self.target_length, self.melbins]) + 0.01
             print('there is an error in loading audio')
             
         frames = self._get_frames(video_name)
@@ -447,10 +593,6 @@ class VideoAudioEvalDataset(Dataset):
             fbank = torch.roll(fbank, np.random.randint(-self.target_length, self.target_length), 0)
 
         # fbank shape is [time_frame_num, frequency_bins], e.g., [1024, 128]
-        # convert fbank to 8*128*128
-        # fbank = fbank.unsqueeze(0)
-        # fbank = fbank.reshape(8, -1, 128)
-        
         # frames: (T, C, H, W) -> (C, T, H, W)
         frames = frames.permute(1, 0, 2, 3)
         
